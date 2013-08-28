@@ -1,13 +1,13 @@
 module Yodlee
   class Account
-    attr_accessor :id, :name, :institute_id, :institute_name, :account_info
+    attr_accessor :id, :name, :institute_id, :institute_name, :account_info, :current_balance, :last_updated
 
     def initialize(connection)
       @connection = connection
       @account_info, @transactions = nil
     end
 
-    [:simple_transactions, :current_balance, :account_info, :last_updated, :next_update].each do |m|
+    [:simple_transactions, :account_info, :next_update].each do |m|
       define_method m do
         @account_info = @connection.account_info(self) unless @account_info
         m == :account_info ? @account_info : @account_info[m]

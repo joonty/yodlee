@@ -3,35 +3,39 @@ module Yodlee
     def initialize(credentials, logger = nil)
       @credentials = credentials
       @logger = logger
-  
+
       @connected = false
       @accounts = nil
 
-      @agent = WWW::Mechanize.new
+      @agent = Mechanize.new
+      @agent.log = @logger
+      @agent.redirect_ok = true
       @agent.user_agent = 'Mozilla/5.0 (Windows; U; Windows NT 6.0; en-US; rv:1.9.0.5) Gecko/2008120122 Firefox/3.0.5'
 
       @accounts_page = nil
     end
-  
+
     def accounts
       return @accounts if @accounts
-  
+
       handle_connection!
 
-      doc = Nokogiri::HTML.parse(@accounts_page.body)
-
-      @accounts = doc.search(".acctbean a").map{|e|
+      @accounts = @accounts_page.search("#Banking_div tbody:last tr").map{|e|
         acct = Account.new(self)
 
-        e['href'].scan(/(\w+Id)=(\d+)/).each do |k,v|
-          case k 
-            when /itemAccountId/ then acct.id = v
-            when /itemId/        then acct.institute_id = v
-          end
-        end
+        #e['href'].scan(/(\w+Id)=(\d+)/).each do |k,v|
+        #  case k
+        #    when /itemAccountId/ then acct.id = v
+        #    when /itemId/        then acct.institute_id = v
+        #  end
+        #end
 
-        acct.institute_name = e.at('strong').text
-        acct.name = e.children.last.text.sub(/^\s*-\s*/,'')
+        #acct.institute_name = e.at('strong').text
+        #acct.name = e.children.last.text.sub(/^\s*-\s*/,'')
+        acct.name = e.at('.accountName').text.strip
+        acct.institute_name = acct.name
+        acct.current_balance = e.at('td:last').text.strip
+        acct.last_updated = e.at('.text-content-type-1 span:last').text.strip
         acct
       }
     end
@@ -43,14 +47,12 @@ module Yodlee
       link.href << "&dateRangeId=-1"
       page = link.click
 
-      doc = Nokogiri::HTML.parse(page.body)
-
-      last_upd, next_upd = doc.at(".accountlinks").text.scan(/Last updated (.*?)\s*\(next scheduled update (.*)\)/).flatten
+      last_upd, next_upd = page.at(".accountlinks").text.scan(/Last updated (.*?)\s*\(next scheduled update (.*)\)/).flatten
 
       # Regular accounts have a heading + div, investments have heading + table
-      regular_acct = doc.at("h2[contains('Account Overview')] + div")
+      regular_acct = page.at("h2[contains('Account Overview')] + div")
 
-      account_info = regular_acct ? regular_account_info(doc) : investment_account_info(doc)
+      account_info = regular_acct ? regular_account_info(page) : investment_account_info(page)
       account_info[:next_update]  = next_upd
       account_info[:last_updated] = last_upd
 
@@ -58,7 +60,7 @@ module Yodlee
       account_info[:simple_transactions] = csv_page.response['content-type'] =~ /csv/ ? csv_page.body : []
 
       # XXX: gross. this side-effect required by transactions(acct).
-      @script_sess = doc.to_s.scan(/scriptSessionId='([\d\w]+)'/).last.to_s
+      @script_sess = page.to_s.scan(/scriptSessionId='([\d\w]+)'/).last.to_s
 
       account_info
     end
@@ -76,12 +78,12 @@ module Yodlee
     def investment_account_info(doc)
       account_info = {}
       account_info[:holdings] = [] # TODO
-      account_info[:current_balance] = 
+      account_info[:current_balance] =
         doc.search("h2[contains('Account Overview')] + table tr[last()] td[last()]").text
       account_info
     end
 
-    # This method returns each transaction as an object, based on the underyling javascript 
+    # This method returns each transaction as an object, based on the underyling javascript
     # structures used to build the transactions as displayed in the Yodlee UI. These objects
     # are able to access more information than the CSV Yodlee provides, such as the finanical
     # institute's transaction id, useful for tracking duplicates.
@@ -89,7 +91,7 @@ module Yodlee
     # Calling this method requires Johnson to be installed, otherwise an exception is raised.
     def transactions(acct)
       unless Object.const_defined? "Johnson"
-        raise "Johnson not found. Install the johnson gem, or use simple_transactions instead." 
+        raise "Johnson not found. Install the johnson gem, or use simple_transactions instead."
       end
 
       sc = @agent.cookies.detect{|c| c.name == "JSESSIONID"}
@@ -195,28 +197,31 @@ module Yodlee
 
       return []
     end
-  
+
     def handle_connection!
       login unless connected?
     end
-  
+
     def login
       @connected = false
       page = nil
 
-      %w(provide_username answer_question check_expectation provide_password).each do |m|
+      %w(provide_username answer_question check_expectation provide_password accept_nojs).each do |m|
         page = send(*[m, page].compact)
       end
-      
+      log(:info, "Completed login process")
+      title_node = @accounts_page.at("#mini_main_0 span")
+      puts "Loaded #{title_node.text.strip}"
+
       @connected = true
     end
-  
+
     def connected?
       @connected
     end
-  
+
     def log(level, msg)
-      @logger.__send__(level, question) if @logger
+      @logger.__send__(level, msg) if @logger
     end
 
     # login scrapers
@@ -225,28 +230,27 @@ module Yodlee
       p = @agent.get 'https://moneycenter.yodlee.com/'
       f = p.form_with(:name => 'loginForm')
       f['loginName'] = @credentials.username
-      @agent.submit(f)
+      f.submit
     end
 
     def answer_question(page)
       question = Nokogiri::HTML.parse(page.body).at("label[@for=answer]").text
       log(:debug, question)
-      
+
       begin
         answer = @credentials.answers.detect{|q, a| question =~ /^#{Regexp.escape(q)}/}.last
-      rescue 
+      rescue
         raise NoAnswerForQuestion, "No answer found for #{question}"
       end
 
       f = page.form_with(:name => 'loginForm')
       f['answer'] = answer
 
-      @agent.submit(f)
+      f.submit
     end
 
     def check_expectation(page)
-      d = Nokogiri::HTML.parse(page.body)
-      node = d.at("dl > dt[contains('Secret Phrase')] + dd .caption")
+      node = page.at("dl > dt[contains('Secret Phrase')] + dd .caption")
 
       if node
         if @credentials.expectation == node.previous.text.strip
@@ -255,6 +259,7 @@ module Yodlee
           raise ExpectationMismatch, "Expectation found, but was incorrect"
         end
       else
+        log(:debug, page.body)
         raise ExpectationNotFound, "Didn't find expectation"
       end
     end
@@ -262,12 +267,25 @@ module Yodlee
     def provide_password(page)
       f = page.form_with(:name => 'loginForm')
       f['password'] = @credentials.password
-      page = @agent.submit(f)
+      f.submit
+    end
 
-      # ack javascript disabled
+    def accept_nojs(page)
       f = page.form_with(:name => 'updateForm')
-
-      @accounts_page = @agent.submit(f)
+      loading_page = f.submit
+      scripts = loading_page.search('script').map(&:text)
+      home_url = ""
+      scripts.each do |s|
+        matches = /var homeUrl = "([^"]+)/.match(s)
+        if matches
+          home_url = matches[1]
+          break
+        end
+      end
+      puts "URL: #{home_url}"
+      if home_url
+        @accounts_page = @agent.get home_url
+      end
     end
   end
 end
